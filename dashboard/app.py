@@ -1,393 +1,209 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
+import json
 import os
-
-
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
 
 st.set_page_config(
-    page_title="AI-IMU Dead Reckoning",
-    page_icon="🛰️",
+    page_title="Live Smartphone Navigation",
+    page_icon="📱",
     layout="wide"
 )
 
-
-# ============================================================
-# CSS
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-
-    .block-container {
-        padding-left: 3rem;
-        padding-right: 3rem;
-        padding-top: 2rem;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# TITLE
-# ============================================================
-
-st.title("🛰️ AI-IMU Dead Reckoning")
-
-st.subheader(
-    "GPS-Denied Position Estimation Prototype"
-)
-
-st.write(
-    "Hybrid navigation system combining Physics Dead Reckoning, "
-    "Extended Kalman Filter and LSTM-based AI correction."
-)
-
-
-# ============================================================
-# LOAD DATA
-# ============================================================
-
-csv_path = "results/final_results.csv"
-
-if not os.path.exists(csv_path):
-
-    st.error(
-        "Results file not found. Run 'python test.py' first."
-    )
-
-    st.stop()
-
-
-df = pd.read_csv(csv_path)
-
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-physics_rmse = 15.4797
-ekf_rmse = 3.5162
-ai_rmse = 11.0420
-hybrid_rmse = 2.4575
-
-outage_start = 20
-outage_end = 40
-
-
-# ============================================================
-# GPS SIMULATION
-# ============================================================
-
-st.markdown("## 🛰️ GPS Simulation")
-
-simulation_time = st.slider(
-    "Select Simulation Time (seconds)",
-    min_value=0.0,
-    max_value=float(df["timestamp"].max()),
-    value=10.0,
-    step=0.5
-)
-
-
-# Find closest timestamp
-index = (
-    np.abs(df["timestamp"] - simulation_time)
-).argmin()
-
-current = df.iloc[index]
-
-
-# ============================================================
-# GPS STATUS
-# ============================================================
-
-if outage_start <= simulation_time <= outage_end:
-
-    gps_status = "🔴 GPS SIGNAL LOST"
-
-    st.error(
-        f"GPS unavailable from {outage_start}s to {outage_end}s"
-    )
-
-    system_status = "EKF + AI Dead Reckoning Active"
-
-else:
-
-    gps_status = "🟢 GPS AVAILABLE"
-
-    st.success(
-        "GPS signal available"
-    )
-
-    system_status = "Hybrid GPS + EKF + AI Fusion"
-
-
-# ============================================================
-# STATUS DISPLAY
-# ============================================================
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-
-    st.metric(
-        "Current Time",
-        f"{simulation_time:.1f} s"
-    )
-
-with col2:
-
-    st.metric(
-        "GPS Status",
-        gps_status
-    )
-
-with col3:
-
-    st.metric(
-        "Navigation Mode",
-        system_status
-    )
-
-
-# ============================================================
-# CURRENT POSITION
-# ============================================================
-
-st.markdown("## 📍 Current Position Estimate")
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-
-    st.metric(
-        "Ground Truth X",
-        f"{current['ground_truth_x']:.3f} m"
-    )
-
-with col2:
-
-    st.metric(
-        "Physics DR X",
-        f"{current['dr_x']:.3f} m"
-    )
-
-with col3:
-
-    st.metric(
-        "AI-DR X",
-        f"{current['ai_dr_x']:.3f} m"
-    )
-
-with col4:
-
-    st.metric(
-        "Hybrid X",
-        f"{current['hybrid_x']:.3f} m"
-    )
-
-
-# ============================================================
-# PERFORMANCE
-# ============================================================
-
-st.markdown("## 📊 System Performance")
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-
-    st.metric(
-        "Physics DR RMSE",
-        f"{physics_rmse:.2f} m"
-    )
-
-with col2:
-
-    st.metric(
-        "EKF RMSE",
-        f"{ekf_rmse:.2f} m"
-    )
-
-with col3:
-
-    st.metric(
-        "AI-DR RMSE",
-        f"{ai_rmse:.2f} m"
-    )
-
-with col4:
-
-    st.metric(
-        "Hybrid RMSE",
-        f"{hybrid_rmse:.2f} m"
-    )
-
-
-# ============================================================
-# IMPROVEMENT
-# ============================================================
-
-improvement = (
-    (physics_rmse - hybrid_rmse)
-    / physics_rmse
-) * 100
-
-
-st.success(
-    f"🚀 Hybrid system reduces RMSE by "
-    f"{improvement:.2f}% compared with Physics DR."
-)
-
-
-# ============================================================
-# TRAJECTORY
-# ============================================================
-
-st.markdown("## 📍 Live Trajectory Simulation")
-
-
-visible_df = df[
-    df["timestamp"] <= simulation_time
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
+STATE_FILE = os.path.join(RESULTS_DIR, "live_state.json")
+CONTROL_FILE = os.path.join(RESULTS_DIR, "outage_override.json")
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# ------------------------------------------------------------
+# 1. HELPERS
+# ------------------------------------------------------------
+def get_state():
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def is_outage_forced():
+    if os.path.exists(CONTROL_FILE):
+        try:
+            with open(CONTROL_FILE, "r") as f:
+                return json.load(f).get("force_outage", False)
+        except Exception:
+            pass
+    return False
+
+def set_outage_forced(status: bool):
+    try:
+        with open(CONTROL_FILE, "w") as f:
+            json.dump({"force_outage": status}, f)
+    except Exception:
+        pass
+
+if "speeds" not in st.session_state:
+    st.session_state.speeds = [0.0] * 25
+
+# ------------------------------------------------------------
+# 2. STATIC HEADER & CONTROL BUTTONS
+# ------------------------------------------------------------
+st.title("📱 Live Smartphone Navigation")
+st.caption("Real-time smartphone IMU telemetry received by the Python engine via local TCP sockets.")
+
+c1, c2, _ = st.columns([1.6, 1.6, 4])
+with c1:
+    if st.button("🚨 Simulate GPS Outage (Tunnel)", width="stretch", type="primary" if is_outage_forced() else "secondary"):
+        set_outage_forced(True)
+        st.rerun()
+
+with c2:
+    if st.button("🛰️ Restore GPS Lock", width="stretch", type="secondary" if is_outage_forced() else "primary"):
+        set_outage_forced(False)
+        st.rerun()
+
+# Jaipur - Kota Highway Corridor Coordinates
+start_lat, start_lon = 26.785892, 75.818937
+highway_corridor = [
+    [26.790500, 75.816000],
+    [26.788500, 75.817800],
+    [26.786500, 75.819800],
+    [26.784000, 75.822200],
+    [26.782000, 75.824200]
 ]
 
+# ------------------------------------------------------------
+# 3. UNIFIED SMOOTH REFRESH FRAGMENT (600ms)
+# ------------------------------------------------------------
+@st.fragment(run_every="600ms")
+def render_live_dashboard():
+    state = get_state()
+    forced_outage = is_outage_forced()
 
-if len(visible_df) > 0:
+    speed_ms = float(state.get("speed", 0.0))
+    speed_kmh = speed_ms * 3.6
+    dist = float(state.get("distance", 0.0))
+    step_count = int(state.get("step_count", 0))
+    heading_deg = float(state.get("yaw", 0.0))
+    curr_lat = float(state.get("latitude", start_lat))
+    curr_lon = float(state.get("longitude", start_lon))
+    path = state.get("path", [])
+    gps_valid = bool(state.get("gps_valid", True)) and not forced_outage
 
-    chart_df = visible_df[
-        [
-            "ground_truth_x",
-            "ground_truth_y",
-            "dr_x",
-            "dr_y",
-            "ai_dr_x",
-            "ai_dr_y",
-            "hybrid_x",
-            "hybrid_y"
-        ]
-    ].copy()
+    # Maintain fixed 25-point rolling window
+    st.session_state.speeds.append(round(speed_kmh, 2))
+    st.session_state.speeds = st.session_state.speeds[-25:]
 
-    chart_df.columns = [
-        "Ground Truth X",
-        "Ground Truth Y",
-        "Physics DR X",
-        "Physics DR Y",
-        "AI-DR X",
-        "AI-DR Y",
-        "Hybrid X",
-        "Hybrid Y"
-    ]
+    # Status Banner
+    if gps_valid:
+        st.success("🛰️ **GPS LOCK CONFIRMED** — Standard Hybrid GPS + EKF Navigation Active.")
+    else:
+        st.error("🚨 **GPS OUTAGE DETECTED** — AI-ML Intelligent Dead Reckoning Active.")
 
-    st.line_chart(
-        chart_df,
-        x=None,
-        use_container_width=True
+    # 4 Main Metric Cards
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.markdown("<p style='color: #8E95A5; margin-bottom: 2px; font-size: 14px;'>Navigation Mode</p>", unsafe_allow_html=True)
+        if gps_valid:
+            st.markdown("<h3 style='margin: 0; color: #00E676;'>🟢 GPS + EKF</h3>", unsafe_allow_html=True)
+        else:
+            st.markdown("<h3 style='margin: 0; color: #FF4B4B;'>🔴 AI-DR (Dead Reckoning)</h3>", unsafe_allow_html=True)
+
+    with m2:
+        st.metric("Current Speed", f"{speed_kmh:.1f} km/h", f"{speed_ms:.2f} m/s")
+
+    with m3:
+        st.metric("Heading (Yaw)", f"{heading_deg:.1f}°")
+
+    with m4:
+        st.metric("Distance Covered", f"{dist:.1f} m", f"{step_count} Steps")
+
+    # Live Speed Graph with clean, positive 1..25 indices
+    st.markdown("**⚡ Live Telemetry Speed Response (km/h)**")
+    df_chart = pd.DataFrame(
+        {"Speed": st.session_state.speeds},
+        index=[f"T-{25-i}" for i in range(25)]
+    )
+    st.line_chart(df_chart, height=130, width="stretch")
+
+    # Attitude Accordion
+    with st.expander("📐 Sensor Orientation & Attitude Readouts", expanded=False):
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Roll", f"{float(state.get('roll', 0.0)):.2f}°")
+        e2.metric("Pitch", f"{float(state.get('pitch', 0.0)):.2f}°")
+        e3.metric("Local X Displacement", f"{float(state.get('x', 0.0)):.2f} m")
+        e4.metric("Local Y Displacement", f"{float(state.get('y', 0.0)):.2f} m")
+
+    # Folium Map
+    m = folium.Map(
+        location=[(start_lat + curr_lat) / 2.0, (start_lon + curr_lon) / 2.0],
+        zoom_start=18,
+        tiles="OpenStreetMap"
     )
 
+    # 1. Orange Highway Corridor
+    folium.PolyLine(
+        highway_corridor,
+        color="#FF7043",
+        weight=20,
+        opacity=0.45,
+        tooltip="Jaipur - Kota Highway Corridor"
+    ).add_to(m)
 
-# ============================================================
-# TRAJECTORY IMAGE
-# ============================================================
+    folium.PolyLine(
+        highway_corridor,
+        color="#D84315",
+        weight=3,
+        dash_array="8, 10"
+    ).add_to(m)
 
-st.markdown("## 🗺️ Complete Trajectory")
+    # 2. Dotted Guidance Link to Highway Corridor
+    folium.PolyLine(
+        [[curr_lat, curr_lon], highway_corridor[2]],
+        color="#8D6E63",
+        weight=4,
+        dash_array="4, 8",
+        opacity=0.7
+    ).add_to(m)
 
-trajectory_path = (
-    "results/trajectory_comparison.png"
-)
+    # 3. Dedicated Walking Track between Start and Current Position
+    active_track = path if (path and len(path) > 1) else [[start_lat, start_lon], [curr_lat, curr_lon]]
+    folium.PolyLine(
+        active_track,
+        color="#E53935",
+        weight=6,
+        opacity=0.95,
+        tooltip="Dead Reckoning Trajectory"
+    ).add_to(m)
 
-if os.path.exists(trajectory_path):
+    # 4. Green Start Marker
+    folium.Marker(
+        [start_lat, start_lon],
+        icon=folium.Icon(color="green", icon="play", prefix="fa"),
+        popup="Starting Point"
+    ).add_to(m)
 
-    st.image(
-        trajectory_path,
-        use_container_width=True
-    )
+    # 5. Red Current Position Marker
+    folium.Marker(
+        [curr_lat, curr_lon],
+        icon=folium.Icon(color="red", icon="exclamation-triangle", prefix="fa"),
+        popup="Current Dead Reckoning Position"
+    ).add_to(m)
 
+    folium.CircleMarker(
+        [curr_lat, curr_lon],
+        radius=12,
+        color="#E53935",
+        weight=2,
+        fill=True,
+        fill_color="#FFCDD2",
+        fill_opacity=0.6
+    ).add_to(m)
 
-# ============================================================
-# ERROR COMPARISON
-# ============================================================
+    st_folium(m, width=1200, height=480, key="nav_map_stream", returned_objects=[])
 
-st.markdown("## 📉 RMSE Comparison")
-
-error_path = (
-    "results/error_comparison.png"
-)
-
-if os.path.exists(error_path):
-
-    st.image(
-        error_path,
-        use_container_width=True
-    )
-
-
-# ============================================================
-# GPS OUTAGE
-# ============================================================
-
-st.markdown("## 🛰️ GPS Outage Analysis")
-
-gps_path = (
-    "results/gps_outage.png"
-)
-
-if os.path.exists(gps_path):
-
-    st.image(
-        gps_path,
-        use_container_width=True
-    )
-
-
-# ============================================================
-# ERROR OVER TIME
-# ============================================================
-
-st.markdown("## 📈 Error Over Time")
-
-error_time_path = (
-    "results/error_over_time.png"
-)
-
-if os.path.exists(error_time_path):
-
-    st.image(
-        error_time_path,
-        use_container_width=True
-    )
-
-
-# ============================================================
-# DATA
-# ============================================================
-
-with st.expander("📋 View Dataset"):
-
-    st.write(
-        f"Total samples: {len(df)}"
-    )
-
-    st.dataframe(
-        df.head(100),
-        use_container_width=True
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown("---")
-
-st.caption(
-    "AI-IMU Dead Reckoning Prototype | "
-    "Physics DR + EKF + LSTM + Hybrid GPS Fusion"
-)
+render_live_dashboard()

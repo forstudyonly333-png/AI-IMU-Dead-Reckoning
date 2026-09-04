@@ -1,453 +1,132 @@
+import os
+import sys
 import numpy as np
 import pandas as pd
 import torch
 
-from src.data_loader import generate_demo_data
-from src.preprocessing import preprocess_imu
-from src.dead_reckoning import dead_reckoning
-from src.ekf import SimpleEKF
-from src.ai_adapter import AIAdapter
-from src.evaluation import rmse
-from src.visualization import (
-    plot_error_over_time,
-    plot_trajectory,
-    plot_error_comparison,
-    plot_gps_outage
-)
-from src.hybrid_dr import hybrid_position
-
-print("=" * 60)
-print("       AI-IMU DEAD RECKONING PROTOTYPE")
-print("=" * 60)
-
-
-# ============================================================
-# 1. Generate IMU Dataset
-# ============================================================
-
-df = generate_demo_data()
-
-print("\n[1] IMU data generated")
-print("Shape:", df.shape)
-
-
-# ============================================================
-# 2. Preprocessing
-# ============================================================
-
-df = preprocess_imu(df)
-
-print("[2] Preprocessing complete")
-
-
-# ============================================================
-# 3. Physics-Based Dead Reckoning
-# ============================================================
-
-dr_position, velocity = dead_reckoning(df)
-
-print("[3] Physics Dead Reckoning complete")
-
-
-# ============================================================
-# 4. Ground Truth FROM DATASET
-# ============================================================
-
-t = df["timestamp"].values
-
-ground_truth = df[
-    ["gt_x", "gt_y", "gt_z"]
-].values
-
-
-print("[4] Ground truth loaded from dataset")
-
-
-# ============================================================
-# 5. GPS Simulation
-# ============================================================
-
-gps_position = ground_truth.copy()
-
-outage_start = 20
-outage_end = 40
-
-gps_available = (
-    (t < outage_start)
-    |
-    (t > outage_end)
-)
-
-print(
-    f"[5] GPS outage simulated: "
-    f"{outage_start}s - {outage_end}s"
-)
-
-
-# ============================================================
-# 6. EKF
-# ============================================================
-
-ekf = SimpleEKF()
-
-ekf_position = np.zeros(
-    (len(t), 3)
-)
-
-
-for i in range(len(t)):
-
-    acceleration = np.array([
-        df.iloc[i]["ax"],
-        df.iloc[i]["ay"],
-        df.iloc[i]["az"] - 9.81
-    ])
-
-    dt = df.iloc[i]["dt"]
-
-    # Prediction
-    ekf.predict(
-        acceleration,
-        dt
-    )
-
-    # GPS correction
-    if gps_available[i]:
-
-        ekf.update(
-            gps_position[i]
-        )
-
-    ekf_position[i] = (
-        ekf.get_position()
-    )
-
-
-print(
-    "[6] EKF prediction/correction complete"
-)
-
-
-# ============================================================
-# 7. Load Trained LSTM
-# ============================================================
-
-model = AIAdapter(
-    input_size=6,
-    hidden_size=32
-)
-
-model.load_state_dict(
-    torch.load(
-        "models/ai_adapter.pth",
-        map_location="cpu"
-    )
-)
-
-model.eval()
-
-print(
-    "[7] Trained LSTM model loaded"
-)
-
-
-# ============================================================
-# 8. Prepare IMU Features
-# ============================================================
-
-features = df[
-    ["ax", "ay", "az", "gx", "gy", "gz"]
-].values.astype(
-    np.float32
-)
-
-
-# Normalization
-feature_mean = features.mean(axis=0)
-
-feature_std = (
-    features.std(axis=0)
-    + 1e-8
-)
-
-features = (
-    features - feature_mean
-) / feature_std
-
-
-# ============================================================
-# 9. LSTM Residual Prediction
-# ============================================================
-
-sequence_length = 20
-
-ai_correction = np.zeros(
-    (len(features), 3)
-)
-
-
-with torch.no_grad():
-
-    for i in range(
-        sequence_length,
-        len(features)
-    ):
-
-        sequence = features[
-            i-sequence_length:i
-        ]
-
-        sequence = torch.tensor(
-            sequence,
-            dtype=torch.float32
-        ).unsqueeze(0)
-
-        prediction = model(
-            sequence
-        )
-
-        ai_correction[i] = (
-            prediction.numpy()[0]
-        )
-
-
-print(
-    "[8] LSTM residual prediction complete"
-)
-
-
-# ============================================================
-# 10. AI-DR Position
-# ============================================================
-
-ai_position = (
-    dr_position
-    + ai_correction
-)
-
-# ============================================================
-# Hybrid GPS + EKF + AI
-# ============================================================
-
-hybrid_position_result = hybrid_position(
-    gps_position,
-    ekf_position,
-    ai_position,
-    gps_available
-)
-
-print(
-    "[9] AI-DR position calculated"
-)
-
-print(
-    "[10] Hybrid GPS + EKF + AI position calculated"
-)
-
-
-
-# ============================================================
-# 11. Evaluation
-# ============================================================
-
-dr_error = rmse(
-    dr_position,
-    ground_truth
-)
-
-ekf_error = rmse(
-    ekf_position,
-    ground_truth
-)
-
-ai_error = rmse(
-    ai_position,
-    ground_truth
-)
-
-hybrid_error = rmse(
-    hybrid_position_result,
-    ground_truth
-)
-
-
-# ============================================================
-# 12. Improvements
-# ============================================================
-
-ekf_improvement = (
-    (dr_error - ekf_error)
-    / dr_error
-) * 100
-
-
-ai_improvement = (
-    (dr_error - ai_error)
-    / dr_error
-) * 100
-
-
-# ============================================================
-# 13. Print Results
-# ============================================================
-
-print("\n")
-
-print("=" * 60)
-print("                    RESULTS")
-print("=" * 60)
-
-print(
-    f"\nPhysics DR RMSE : "
-    f"{dr_error:.4f} m"
-)
-
-print(
-    f"EKF RMSE        : "
-    f"{ekf_error:.4f} m"
-)
-
-print(
-    f"Actual AI-DR RMSE: "
-    f"{ai_error:.4f} m"
-)
-
-print(
-    f"Hybrid RMSE      : "
-    f"{hybrid_error:.4f} m"
-)
-
-print(
-    f"\nEKF improvement: "
-    f"{ekf_improvement:.2f}%"
-)
-
-print(
-    f"AI-DR improvement: "
-    f"{ai_improvement:.2f}%"
-)
-
-
-# ============================================================
-# 14. Save Results
-# ============================================================
-
-results_df = pd.DataFrame({
-    "timestamp": t,
-
-    "ground_truth_x": ground_truth[:, 0],
-    "ground_truth_y": ground_truth[:, 1],
-
-    "dr_x": dr_position[:, 0],
-    "dr_y": dr_position[:, 1],
-
-    "ekf_x": ekf_position[:, 0],
-    "ekf_y": ekf_position[:, 1],
-
-    "ai_dr_x": ai_position[:, 0],
-    "ai_dr_y": ai_position[:, 1],
-
-    "hybrid_x": hybrid_position_result[:, 0],
-    "hybrid_y": hybrid_position_result[:, 1],
-
-    "gps_available": gps_available
-})
-
-
-results_df.to_csv(
-    "results/final_results.csv",
-    index=False
-)
-
-# ============================================================
-# 15. Visualization
-# ============================================================
-
-print("\nGenerating visualizations...")
-
-plot_trajectory(
-    ground_truth,
-    dr_position,
-    ai_position,
-    hybrid_position_result
-)
-
-print("[V1] Trajectory graph saved")
-
-
-plot_error_comparison(
-    dr_error,
-    ekf_error,
-    ai_error,
-    hybrid_error
-)
-
-print("[V2] Error comparison graph saved")
-
-
-plot_gps_outage(
-    t,
-    ground_truth,
-    dr_position,
-    ai_position,
-    hybrid_position_result,
-    outage_start,
-    outage_end
-)
-
-print("[V3] GPS outage graph saved")
-
-
-plot_error_over_time(
-    t,
-    ground_truth,
-    dr_position,
-    ai_position,
-    hybrid_position_result,
-    outage_start,
-    outage_end
-)
-
-print("[V4] Error-over-time graph saved")
-
-
-print("\n============================================")
-print("ALL VISUALIZATIONS GENERATED SUCCESSFULLY")
-print("============================================")
-
-print("results/trajectory_comparison.png")
-print("results/error_comparison.png")
-print("results/gps_outage.png")
-print("results/error_over_time.png")
-
-print("\nPrototype completed successfully!")
-
-
-print(
-    "\nResults saved successfully!"
-)
-
-print(
-    "results/final_results.csv"
-)
-
-print(
-    "results/trajectory_comparison.png"
-)
-
-print(
-    "results/error_comparison.png"
-)
-
-
-print(
-    "results/gps_outage.png"
-)
-
-print(
-    "results/error_over_time.png"
-)
-
-print(
-    "\nPrototype completed successfully!"
-)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+os.makedirs("results", exist_ok=True)
+
+def generate_test_data(seed=123):
+    np.random.seed(seed)
+    t = np.arange(0, 100, 0.05)
+    n = len(t)
+    dt = 0.05
+
+    gt_x = 20 * np.sin(0.05 * t)
+    gt_y = 10 * np.sin(0.1 * t)
+    gt_z = np.zeros(n)
+
+    vx = np.gradient(gt_x, dt)
+    vy = np.gradient(gt_y, dt)
+    ax = np.gradient(vx, dt) + np.random.normal(0, 0.05, n)
+    ay = np.gradient(vy, dt) + np.random.normal(0, 0.05, n)
+    az = 9.81 + np.random.normal(0, 0.02, n)
+
+    gx = np.random.normal(0, 0.002, n)
+    gy = np.random.normal(0, 0.002, n)
+    gz = 0.02 * np.cos(0.1 * t) + np.random.normal(0, 0.001, n)
+
+    return pd.DataFrame({
+        'timestamp': t,
+        'ax': ax, 'ay': ay, 'az': az,
+        'gx': gx, 'gy': gy, 'gz': gz,
+        'gt_x': gt_x, 'gt_y': gt_y, 'gt_z': gt_z,
+        'dt': dt
+    })
+
+def dead_reckoning(df):
+    n = len(df)
+    pos = np.zeros((n, 3))
+    vel = np.zeros((n, 3))
+    dt = df['dt'].values[0]
+
+    for i in range(1, n):
+        # Linear horizontal acceleration with noise rejection
+        lax = df.iloc[i]['ax']
+        lay = df.iloc[i]['ay']
+        
+        if abs(lax) < 0.05: lax = 0.0
+        if abs(lay) < 0.05: lay = 0.0
+
+        vel[i, 0] = (vel[i-1, 0] + lax * dt) * 0.99
+        vel[i, 1] = (vel[i-1, 1] + lay * dt) * 0.99
+
+        pos[i, 0] = pos[i-1, 0] + vel[i, 0] * dt
+        pos[i, 1] = pos[i-1, 1] + vel[i, 1] * dt
+
+    return pos, vel
+
+class SimpleEKF:
+    def __init__(self, gps_noise_std=3.0):
+        self.pos = np.zeros(3)
+        self.vel = np.zeros(3)
+        self.P = np.eye(6) * 0.1
+        self.Q = np.eye(6) * 0.01
+        self.R = np.eye(3) * (gps_noise_std ** 2)
+
+    def predict(self, acceleration, dt):
+        F = np.eye(6)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+
+        B = np.zeros((6, 3))
+        B[3, 0] = dt
+        B[4, 1] = dt
+        B[5, 2] = dt
+
+        state = np.concatenate([self.pos, self.vel])
+        state = F @ state + B @ acceleration
+        self.P = F @ self.P @ F.T + self.Q
+
+        self.pos = state[:3]
+        self.vel = state[3:]
+
+    def update(self, gps_pos):
+        H = np.zeros((3, 6))
+        H[:3, :3] = np.eye(3)
+        y = gps_pos - self.pos
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        state = np.concatenate([self.pos, self.vel]) + K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
+        self.pos = state[:3]
+        self.vel = state[3:]
+
+    def get_position(self):
+        return self.pos.copy()
+
+def rmse(p1, p2):
+    return np.sqrt(np.mean((p1 - p2) ** 2))
+
+def main():
+    df = generate_test_data()
+    t = df['timestamp'].values
+    dt = df['dt'].values[0]
+    gt = df[['gt_x', 'gt_y', 'gt_z']].values
+
+    dr_pos, _ = dead_reckoning(df)
+
+    ekf = SimpleEKF()
+    ekf_pos = np.zeros_like(gt)
+    gps_available = (t < 20) | (t > 45)
+
+    for i in range(len(t)):
+        accel = np.array([df.iloc[i]['ax'], df.iloc[i]['ay'], df.iloc[i]['az'] - 9.81])
+        ekf.predict(accel, dt)
+        if gps_available[i]:
+            gps_sample = gt[i] + np.random.normal(0, 1.5, 3)
+            ekf.update(gps_sample)
+        ekf_pos[i] = ekf.get_position()
+
+    print(f"DR RMSE  : {rmse(dr_pos, gt):.3f} m")
+    print(f"EKF RMSE : {rmse(ekf_pos, gt):.3f} m")
+    print("✅ Evaluation complete.")
+
+if __name__ == "__main__":
+    main()

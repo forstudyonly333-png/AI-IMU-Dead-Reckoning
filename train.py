@@ -1,268 +1,146 @@
 import os
+import sys
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-
-from src.data_loader import generate_demo_data
-from src.preprocessing import preprocess_imu
-from src.dead_reckoning import dead_reckoning
-from src.ai_adapter import AIAdapter
-
-
-print("=" * 60)
-print("        AI-IMU LSTM TRAINING")
-print("=" * 60)
-
-
-# ============================================================
-# 1. Generate and preprocess IMU data
-# ============================================================
-
-df = generate_demo_data()
-
-df = preprocess_imu(df)
-
-print("\n[1] IMU data prepared")
-print("Samples:", len(df))
-
-
-# ============================================================
-# 2. Physics-based Dead Reckoning
-# ============================================================
-
-dr_position, velocity = dead_reckoning(df)
-
-print("[2] Physics DR calculated")
-
-
-# ============================================================
-# Create Ground Truth from actual dataset
-
-ground_truth = df[
-    ["gt_x", "gt_y", "gt_z"]
-].values.astype(np.float32)
-
-print("[3] Ground truth loaded from dataset")
-
-
-# ============================================================
-# 4. Calculate residual/error
-# ============================================================
-
-residual = (
-    ground_truth - dr_position
-)
-
-print("[3] Residual targets created")
-
-
-# ============================================================
-# 5. Prepare IMU features
-# ============================================================
-
-features = df[
-    ["ax", "ay", "az", "gx", "gy", "gz"]
-].values.astype(np.float32)
-
-residual = residual.astype(np.float32)
-
-
-# Normalize features
-feature_mean = features.mean(axis=0)
-feature_std = features.std(axis=0) + 1e-8
-
-features = (
-    features - feature_mean
-) / feature_std
-
-
-# ============================================================
-# 6. Create sequences
-# ============================================================
-
-sequence_length = 20
-
-X = []
-Y = []
-
-for i in range(
-    sequence_length,
-    len(features)
-):
-
-    X.append(
-        features[
-            i-sequence_length:i
-        ]
-    )
-
-    Y.append(
-        residual[i]
-    )
-
-
-X = np.array(X)
-Y = np.array(Y)
-
-
-print("[4] Sequences created")
-print("Input shape:", X.shape)
-print("Target shape:", Y.shape)
-
-
-# ============================================================
-# Train / Validation split
-# ============================================================
-
-rng = np.random.default_rng(42)
-
-indices = np.arange(len(X))
-
-rng.shuffle(indices)
-
-split = int(
-    0.8 * len(indices)
-)
-
-train_indices = indices[:split]
-val_indices = indices[split:]
-
-X_train = X[train_indices]
-Y_train = Y[train_indices]
-
-X_val = X[val_indices]
-Y_val = Y[val_indices]
-
-
-# Convert to PyTorch tensors
-
-X_train = torch.tensor(
-    X_train,
-    dtype=torch.float32
-)
-
-Y_train = torch.tensor(
-    Y_train,
-    dtype=torch.float32
-)
-
-X_val = torch.tensor(
-    X_val,
-    dtype=torch.float32
-)
-
-Y_val = torch.tensor(
-    Y_val,
-    dtype=torch.float32
-)
-
-
-# ============================================================
-# 8. Create LSTM model
-# ============================================================
-
-model = AIAdapter(
-    input_size=6,
-    hidden_size=32
-)
-
-print("\n[5] LSTM model created")
-print(model)
-
-
-# ============================================================
-# 9. Loss and optimizer
-# ============================================================
-
-criterion = nn.MSELoss()
-
-optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=0.001
-)
-
-
-# ============================================================
-# 10. Training
-# ============================================================
-
-epochs = 100
-
-print("\n[6] Training started...\n")
-
-
-for epoch in range(epochs):
-
+from torch.utils.data import DataLoader, TensorDataset
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# ------------------------------------------------------------
+# 1. Model Definition (Matches test.py AIAdapter)
+# ------------------------------------------------------------
+class AIAdapter(nn.Module):
+    def __init__(self, input_size=6, hidden_size=32):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 3)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        return self.fc(lstm_out[:, -1, :])
+
+# ------------------------------------------------------------
+# 2. Synthetic Dataset with Stationary & Dynamic Phases
+# ------------------------------------------------------------
+def generate_training_data(n_samples=4000, dt=0.05):
+    np.random.seed(42)
+    t = np.arange(0, n_samples * dt, dt)
+    n = len(t)
+
+    # Alternate between moving and resting every 20 seconds
+    cycle = (t % 20.0) < 12.0  # True = moving, False = stationary
+
+    # Ground truth trajectory
+    gt_x = np.zeros(n)
+    gt_y = np.zeros(n)
+    gt_z = np.zeros(n)
+
+    curr_x, curr_y = 0.0, 0.0
+    for i in range(1, n):
+        if cycle[i]:
+            speed = 2.0 + 0.5 * np.sin(0.2 * t[i])
+            heading = 0.1 * t[i]
+            curr_x += speed * np.cos(heading) * dt
+            curr_y += speed * np.sin(heading) * dt
+        gt_x[i] = curr_x
+        gt_y[i] = curr_y
+
+    vx = np.gradient(gt_x, dt)
+    vy = np.gradient(gt_y, dt)
+    ax = np.gradient(vx, dt)
+    ay = np.gradient(vy, dt)
+    az = np.full(n, 9.81)
+
+    # Add realistic sensor bias and noise
+    ax += np.random.normal(0.02, 0.04, n)
+    ay += np.random.normal(-0.01, 0.04, n)
+    az += np.random.normal(0, 0.03, n)
+
+    gx = np.random.normal(0, 0.002, n)
+    gy = np.random.normal(0, 0.002, n)
+    gz = np.where(cycle, 0.1 + np.random.normal(0, 0.005, n), np.random.normal(0, 0.001, n))
+
+    # Dead reckoning position calculation to determine residuals
+    dr_x, dr_y, dr_z = np.zeros(n), np.zeros(n), np.zeros(n)
+    vel = np.zeros(3)
+    for i in range(1, n):
+        linear_acc = np.array([ax[i], ay[i], az[i] - 9.81])
+        if abs(linear_acc[0]) < 0.05: linear_acc[0] = 0.0
+        if abs(linear_acc[1]) < 0.05: linear_acc[1] = 0.0
+        vel = (vel + linear_acc * dt) * 0.98
+        dr_x[i] = dr_x[i-1] + vel[0] * dt
+        dr_y[i] = dr_y[i-1] + vel[1] * dt
+
+    # Residual targets: ground truth minus dead reckoning
+    target_res = np.column_stack([gt_x - dr_x, gt_y - dr_y, gt_z - dr_z])
+    features = np.column_stack([ax, ay, az, gx, gy, gz])
+
+    return features, target_res
+
+# ------------------------------------------------------------
+# 3. Main Training Execution
+# ------------------------------------------------------------
+def train_model():
+    print("=" * 60)
+    print("🧠 TRAINING AI-DR RESIDUAL ADAPTER")
+    print("=" * 60)
+
+    raw_features, targets = generate_training_data()
+
+    # Calculate normalization statistics
+    mean = np.mean(raw_features, axis=0)
+    std = np.std(raw_features, axis=0) + 1e-8
+    norm_features = (raw_features - mean) / std
+
+    # Save normalization statistics for test.py / hybrid_dr.py
+    stats_path = os.path.join(MODELS_DIR, "norm_stats.npz")
+    np.savez(stats_path, mean=mean, std=std)
+    print(f"✅ Normalization stats saved: {stats_path}")
+
+    # Build sequence windows
+    seq_len = 20
+    x_seq, y_target = [], []
+    for i in range(seq_len, len(norm_features)):
+        x_seq.append(norm_features[i - seq_len:i])
+        y_target.append(targets[i])
+
+    x_tensor = torch.tensor(np.array(x_seq), dtype=torch.float32)
+    y_tensor = torch.tensor(np.array(y_target), dtype=torch.float32)
+
+    dataset = TensorDataset(x_tensor, y_tensor)
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+    model = AIAdapter(input_size=6, hidden_size=32)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+
+    print("Training model across 30 epochs...")
     model.train()
+    for epoch in range(1, 31):
+        total_loss = 0.0
+        for batch_x, batch_y in loader:
+            optimizer.zero_grad()
+            preds = model(batch_x)
+            loss = criterion(preds, batch_y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(batch_x)
 
-    optimizer.zero_grad()
+        if epoch % 5 == 0 or epoch == 1:
+            epoch_loss = total_loss / len(dataset)
+            print(f"  Epoch [{epoch:02d}/30] - Loss (MSE): {epoch_loss:.6f}")
 
-    prediction = model(
-        X_train
-    )
+    model_path = os.path.join(MODELS_DIR, "ai_adapter.pth")
+    torch.save(model.state_dict(), model_path)
+    print(f"✅ Model weights saved: {model_path}")
+    print("=" * 60)
 
-    loss = criterion(
-        prediction,
-        Y_train
-    )
-
-    loss.backward()
-
-    optimizer.step()
-
-
-    # Validation
-
-    model.eval()
-
-    with torch.no_grad():
-
-        val_prediction = model(
-            X_val
-        )
-
-        val_loss = criterion(
-            val_prediction,
-            Y_val
-        )
-
-
-    if (
-        epoch == 0
-        or (epoch + 1) % 5 == 0
-    ):
-
-        print(
-            f"Epoch {epoch + 1:02d}/{epochs} "
-            f"| Train Loss: {loss.item():.6f} "
-            f"| Val Loss: {val_loss.item():.6f}"
-        )
-
-
-# ============================================================
-# 11. Save model
-# ============================================================
-
-os.makedirs(
-    "models",
-    exist_ok=True
-)
-
-model_path = (
-    "models/ai_adapter.pth"
-)
-
-torch.save(
-    model.state_dict(),
-    model_path
-)
-
-
-print("\n[7] Training completed!")
-
-print(
-    "Model saved at:",
-    model_path
-)
-
-print("\nAI model is ready!")
+if __name__ == "__main__":
+    train_model()
